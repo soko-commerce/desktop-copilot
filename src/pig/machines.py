@@ -56,6 +56,7 @@ class RemoteMachine(Machine):
 
         or as a sync context manager:
 
+ 
         with machine.connect() as conn:
             conn.mouse_move(x=100, y=100)
         """

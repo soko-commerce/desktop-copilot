@@ -66,7 +66,10 @@ class PigAgent():
         )
 
     def create_connection(self, state: MessagesState):
-        machine = self.client.machines.get(self.machine_id)
+        if self.machine_id == "local":
+            machine = self.client.machines.local()
+        else:
+            machine = self.client.machines.get(self.machine_id)
         self.connection = self.client.connections.create(machine)
         self.dims = self.connection.dimensions()
         
