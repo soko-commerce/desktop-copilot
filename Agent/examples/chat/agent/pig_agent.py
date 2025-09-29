@@ -4,6 +4,7 @@ from langchain_core.messages import ToolMessage, HumanMessage
 import base64
 from typing import Optional, Tuple, Dict, List
 from .utils import ensure_tools_resolved
+from muscle_memory import MuscleMemoryController
 
 class PigAgent():
     def __init__(self, pig_client, pig_machine_id, computer_use_llm):
@@ -12,6 +13,7 @@ class PigAgent():
         self.computer_use_llm = computer_use_llm
         self.connection = None
         self.dims = None
+        self.muscle_mem = MuscleMemoryController(self)
         
         # Model's trained dimensions (Claude's assumption)
         self.model_trained_w, self.model_trained_h = 1024, 768
@@ -75,6 +77,9 @@ class PigAgent():
         
         # Set screen dimensions for coordinate scaling
         self.screen_w, self.screen_h = self.dims
+
+        if self.muscle_mem.enabled:
+            self.muscle_mem.set_connection(self.connection)
 
     def call_model(self, state: MessagesState):
 
@@ -293,13 +298,16 @@ class PigAgent():
         # Convert from model coordinates to screen coordinates
         screen_x, screen_y = self.to_screen_coordinates(model_x, model_y)
         
-        # Perform left click
-        self.connection.left_click(screen_x, screen_y)
-        
+        if self.muscle_mem.enabled and model_x is not None and model_y is not None:
+            result_message = self.muscle_mem.left_click(model_x, model_y)
+        else:
+            self.connection.left_click(screen_x, screen_y)
+            result_message = f"Left clicked at: x={model_x if model_x is not None else 'current'}, y={model_y if model_y is not None else 'current'}"
+
         return {
             "messages": ToolMessage(
                 tool_call_id=tool_call["id"],
-                content=f"Left clicked at: x={model_x if model_x is not None else 'current'}, y={model_y if model_y is not None else 'current'}"
+                content=result_message
             )
         }
         
