@@ -30,6 +30,9 @@ export OPENAI_API_KEY="your-openai-api-key"
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
 export PIG_SECRET_KEY="your-api-key"
 export PIG_MACHINE_ID="your-machine-id"
+
+# Muscle memory controls
+MUSCLE_MEM_ENABLED=1
 ```
 
 
