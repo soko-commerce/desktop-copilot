@@ -5,8 +5,17 @@ from typing import Optional
 
 from muscle_mem import Check, Engine
 
+# Configure logging to show muscle_mem logs
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 logger = logging.getLogger(__name__)
+
+# Also set the muscle_mem logger to INFO level to ensure its logs are visible
+muscle_mem_logger = logging.getLogger('muscle_mem')
+muscle_mem_logger.setLevel(logging.INFO)
 
 # Global engine instance
 engine = Engine()
