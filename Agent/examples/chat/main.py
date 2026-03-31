@@ -16,7 +16,7 @@ chat_llm = ChatGroq(
     ) # For the outer chat loop
 
 computer_use_llm = ChatAnthropic( # For computer use agent
-    model="claude-3-7-sonnet-20250219",
+    model="claude-sonnet-4-5-20241022",
     api_key=os.getenv("ANTHROPIC_API_KEY"),
     temperature=0.1, 
     max_retries=50,
