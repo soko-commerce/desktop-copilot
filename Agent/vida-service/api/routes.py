@@ -25,13 +25,14 @@ from agent.vida_prompts import VIDA_SEARCH_PROMPT
 from agent.result_parser import parse_agent_response
 from agent.vida_screens import VidaScreen
 from bridge.ws_bridge import WebSocketBridge
+from bridge.direct_client import DirectPigletClient
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/vida")
 
-# Will be set by main.py on startup
-bridge: WebSocketBridge = None  # type: ignore
+# Will be set by main.py on startup — either WebSocketBridge or DirectPigletClient
+bridge: WebSocketBridge | DirectPigletClient = None  # type: ignore
 
 
 @router.get("/health", response_model=HealthResponse)

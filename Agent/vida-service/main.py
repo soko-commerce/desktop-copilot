@@ -13,8 +13,9 @@ import uvicorn
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 
-from config import API_PORT, BRIDGE_PORT, BRIDGE_SECRET
+from config import API_PORT, BRIDGE_PORT, BRIDGE_SECRET, PIGLET_DIRECT_URL
 from bridge.ws_bridge import WebSocketBridge
+from bridge.direct_client import DirectPigletClient
 from api import routes
 
 logging.basicConfig(
@@ -23,17 +24,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-bridge = WebSocketBridge(port=BRIDGE_PORT, secret=BRIDGE_SECRET)
+if PIGLET_DIRECT_URL:
+    bridge = DirectPigletClient(PIGLET_DIRECT_URL)
+else:
+    bridge = WebSocketBridge(port=BRIDGE_PORT, secret=BRIDGE_SECRET)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: launch WebSocket bridge
     await bridge.start()
     routes.bridge = bridge
-    logger.info(f"VIDA agent service ready — API on {API_PORT}, bridge on {BRIDGE_PORT}")
+    if PIGLET_DIRECT_URL:
+        logger.info(f"VIDA agent service ready — API on {API_PORT}, piglet direct at {PIGLET_DIRECT_URL}")
+    else:
+        logger.info(f"VIDA agent service ready — API on {API_PORT}, bridge on {BRIDGE_PORT}")
     yield
-    # Shutdown
     await bridge.stop()
 
 

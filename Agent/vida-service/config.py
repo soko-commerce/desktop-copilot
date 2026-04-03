@@ -8,6 +8,10 @@ BRIDGE_SECRET = os.getenv("BRIDGE_SECRET", "changeme")
 
 API_PORT = int(os.getenv("API_PORT", "8000"))
 
+# Direct piglet connection (bypasses WebSocket tunnel for local dev)
+# Set to e.g. "http://localhost:3000" when running piglet locally
+PIGLET_DIRECT_URL = os.getenv("PIGLET_DIRECT_URL", "")
+
 # Coordinate system: model trained on 1024x768
 MODEL_WIDTH = 1024
 MODEL_HEIGHT = 768
