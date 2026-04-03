@@ -38,6 +38,18 @@ class WebSocketBridge:
     def connected(self) -> bool:
         return self._piglet is not None
 
+    async def _process_request(self, path, headers):
+        """Fix duplicate headers from piglet/Traefik before websockets validates."""
+        # Piglet sends Sec-WebSocket-Version in custom headers AND the Zig
+        # websocket lib adds it automatically, causing a duplicate that
+        # the Python websockets library rejects as 400.
+        for key in ("Sec-WebSocket-Version", "Upgrade", "Connection"):
+            values = headers.get_all(key)
+            if len(values) > 1:
+                del headers[key]
+                headers[key] = values[0]
+        return None
+
     async def start(self):
         self._server = await websockets.serve(
             self._handler,
@@ -46,6 +58,7 @@ class WebSocketBridge:
             max_size=10 * 1024 * 1024,  # 10MB max message
             ping_interval=30,
             ping_timeout=10,
+            process_request=self._process_request,
         )
         logger.info(f"WebSocket bridge listening on port {self.port}")
 
@@ -55,15 +68,16 @@ class WebSocketBridge:
             await self._server.wait_closed()
             logger.info("WebSocket bridge stopped")
 
-    async def _handler(self, websocket: ServerConnection):
-        # Validate auth
-        auth = websocket.request.headers.get("Authorization", "")
+    async def _handler(self, websocket):
+        # Validate auth — support both legacy and new websockets API
+        headers = getattr(websocket, 'request_headers', None) or getattr(websocket.request, 'headers', {})
+        auth = headers.get("Authorization", "")
         if auth != f"Bearer {self.secret}":
             logger.warning("Piglet connection rejected: bad auth")
             await websocket.close(4001, "Unauthorized")
             return
 
-        fingerprint = websocket.request.headers.get("X-PIGLET-FINGERPRINT", "unknown")
+        fingerprint = headers.get("X-PIGLET-FINGERPRINT", "unknown")
 
         if self._piglet is not None:
             logger.warning("New piglet connection replacing existing one")
