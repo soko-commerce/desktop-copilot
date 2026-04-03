@@ -183,13 +183,7 @@ class WebSocketBridge:
                     "headers": headers or {},
                     "query": "",
                 }
-                logger.info(f"Sending request to piglet: {method} {path}")
-                try:
-                    await self._piglet.send(json.dumps(meta))
-                    logger.info("Sent meta OK")
-                except Exception as e:
-                    logger.error(f"Failed sending meta: {type(e).__name__}: {e}")
-                    raise
+                await self._piglet.send(json.dumps(meta))
 
                 # Send body in chunks
                 if body:
@@ -198,12 +192,7 @@ class WebSocketBridge:
                         await self._piglet.send(chunk)
 
                 # Send end sentinel
-                try:
-                    await self._piglet.send("end")
-                    logger.info("Sent end sentinel OK")
-                except Exception as e:
-                    logger.error(f"Failed sending end: {type(e).__name__}: {e}")
-                    raise
+                await self._piglet.send("end")
 
             # Wait for response
             return await asyncio.wait_for(fut, timeout=timeout)
