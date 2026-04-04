@@ -23,6 +23,7 @@ from agent.vida_agent import (
 )
 from agent.vida_prompts import VIDA_SEARCH_PROMPT
 from agent.result_parser import parse_agent_response
+from agent.direct_search import execute_part_search as direct_part_search
 from agent.vida_screens import VidaScreen
 from bridge.ws_bridge import WebSocketBridge
 from bridge.direct_client import DirectPigletClient
@@ -101,7 +102,8 @@ async def search_parts(req: SearchPartsRequest):
     # --- Tier 3: Full AI agent fallback ---
     logger.info(f"Running full AI agent for: {req.query}")
     agent = build_vida_agent(bridge)
-    prompt = VIDA_SEARCH_PROMPT.format(query=req.query)
+    vin_line = f"VIN: {req.vin}" if req.vin else ""
+    prompt = VIDA_SEARCH_PROMPT.format(query=req.query, vin_line=vin_line)
     input_messages = {"messages": [HumanMessage(content=prompt)]}
     config = {"recursion_limit": req.max_steps}
 
@@ -142,6 +144,36 @@ async def search_parts(req: SearchPartsRequest):
         )
 
 
+@router.post("/search-direct", response_model=SearchPartsResponse)
+async def search_direct(req: SearchPartsRequest):
+    """
+    Direct VIDA search — 2-3 Claude vision calls, no agent loop.
+    Uses Claude to detect screen state and element positions, then
+    executes a deterministic click/type sequence.
+    """
+    if not bridge or not bridge.connected:
+        raise HTTPException(503, "No piglet connected — cannot control VIDA")
+
+    start = time.time()
+    logger.info(f"Direct search: query='{req.query}', vin='{req.vin}'")
+
+    result = await direct_part_search(bridge, req.query, req.vin)
+
+    elapsed = time.time() - start
+    logger.info(f"Direct search completed in {elapsed:.1f}s — "
+                f"{result['claude_calls']} Claude calls, {result['steps_taken']} steps")
+
+    parts = [PartResult(**p) for p in result.get("parts", [])]
+
+    return SearchPartsResponse(
+        success=result["success"],
+        parts=parts,
+        raw_response=result.get("raw_response", ""),
+        steps_taken=result.get("steps_taken", 0),
+        error=result.get("error", ""),
+    )
+
+
 # --- Calibration endpoints ---
 
 
@@ -178,11 +210,117 @@ async def calibrate_screen(req: CalibrateRequest):
     }
 
 
+@router.get("/screenshot")
+async def take_screenshot():
+    """Take a screenshot and return as base64 PNG."""
+    if not bridge or not bridge.connected:
+        raise HTTPException(503, "No piglet connected")
+    from agent import tools as bridge_tools
+    dims = await bridge_tools.get_dimensions(bridge)
+    b64 = await bridge_tools.screenshot(bridge)
+    return {"image": b64, "dimensions": dims}
+
+
+class ActionRequest(BaseModel):
+    action: str  # click, type, key, double_click
+    x: int = 0
+    y: int = 0
+    text: str = ""
+    raw: bool = False  # if True, bypass coordinate scaling
+
+
+@router.post("/action")
+async def perform_action(req: ActionRequest):
+    """Execute a single action via piglet — zero AI calls."""
+    if not bridge or not bridge.connected:
+        raise HTTPException(503, "No piglet connected")
+    from agent import tools as bridge_tools
+    import json
+    await bridge_tools.get_dimensions(bridge)
+
+    if req.action == "click":
+        if req.raw:
+            # Send raw pixel coordinates directly to piglet, bypass _to_screen
+            down = json.dumps({"button": "left", "x": req.x, "y": req.y, "down": True}).encode()
+            up = json.dumps({"button": "left", "x": req.x, "y": req.y, "down": False}).encode()
+            await bridge.send_request("POST", "computer/input/mouse/click", body=down)
+            status, _, _ = await bridge.send_request("POST", "computer/input/mouse/click", body=up)
+            result = "ok" if status == 200 else f"Error: status {status}"
+        else:
+            result = await bridge_tools.left_click(bridge, req.x, req.y)
+    elif req.action == "double_click":
+        result = await bridge_tools.double_click(bridge, req.x, req.y)
+    elif req.action == "right_click":
+        result = await bridge_tools.right_click(bridge, req.x, req.y)
+    elif req.action == "type":
+        result = await bridge_tools.type_text(bridge, req.text)
+    elif req.action == "key":
+        result = await bridge_tools.key_press(bridge, req.text)
+    else:
+        raise HTTPException(400, f"Unknown action: {req.action}")
+    return {"result": result}
+
+
+@router.post("/calibrate-coords")
+async def calibrate_coordinates():
+    """
+    Calibrate coordinate mapping using Windows system metrics.
+    Queries SM_CXSCREEN/SM_CYSCREEN via PowerShell to determine the actual
+    SendInput target space, then computes scale factors.
+    """
+    if not bridge or not bridge.connected:
+        raise HTTPException(503, "No piglet connected")
+    from agent import tools as bridge_tools
+    from agent.calibration import get_calibrator
+
+    await bridge_tools.get_dimensions(bridge)
+
+    calibrator = get_calibrator()
+    gw = bridge_tools._screen_w or 0
+    gh = bridge_tools._screen_h or 0
+    fingerprint = getattr(bridge, '_piglet_fingerprint', '') or ''
+
+    # Force re-calibration
+    calibrator.invalidate()
+    result = await calibrator.calibrate(bridge, gw, gh, fingerprint)
+
+    return {
+        "calibrated": True,
+        "gdigrab_dimensions": {"w": result.gdigrab_w, "h": result.gdigrab_h},
+        "input_dimensions": {"w": result.input_w, "h": result.input_h},
+        "virtual_dimensions": {"w": result.virtual_w, "h": result.virtual_h},
+        "dpi_scale": result.dpi_scale,
+        "scale_factors": {"x": round(result.scale_x, 4), "y": round(result.scale_y, 4)},
+        "calibrated_at": result.calibrated_at,
+    }
+
+
 @router.get("/calibration-status")
 async def calibration_status():
-    """Check which screens have been calibrated."""
+    """Check coordinate calibration state and screen detection status."""
+    from agent.calibration import get_calibrator
+
     detector = get_screen_detector()
-    return {
-        "calibrated": detector.is_calibrated,
-        "screens": list(detector._signatures.keys()),
+    calibrator = get_calibrator()
+
+    status = {
+        "screen_detection": {
+            "calibrated": detector.is_calibrated,
+            "screens": list(detector._signatures.keys()),
+        },
+        "coordinate_calibration": {
+            "calibrated": calibrator.is_calibrated,
+        },
     }
+
+    if calibrator.result:
+        r = calibrator.result
+        status["coordinate_calibration"].update({
+            "gdigrab_dimensions": {"w": r.gdigrab_w, "h": r.gdigrab_h},
+            "input_dimensions": {"w": r.input_w, "h": r.input_h},
+            "dpi_scale": r.dpi_scale,
+            "scale_factors": {"x": round(r.scale_x, 4), "y": round(r.scale_y, 4)},
+            "calibrated_at": r.calibrated_at,
+        })
+
+    return status

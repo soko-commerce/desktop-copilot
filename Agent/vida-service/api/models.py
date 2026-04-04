@@ -5,7 +5,8 @@ from pydantic import BaseModel
 
 class SearchPartsRequest(BaseModel):
     query: str
-    max_steps: int = 30
+    vin: str = ""
+    max_steps: int = 50
 
 
 class PartResult(BaseModel):

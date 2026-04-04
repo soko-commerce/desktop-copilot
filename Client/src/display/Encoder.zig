@@ -141,11 +141,9 @@ pub fn encode(self: Encoder, frame: Frame, allocator: std.mem.Allocator, scale_o
     var rgb_frame = try convertFrame(frame, .RGB24, scale_options);
     defer rgb_frame.deinit();
 
-    // Update codec context dimensions if scaled
-    if (scale_options.width != null and scale_options.height != null) {
-        self.codec_ctx.*.width = rgb_frame.dimensions.width;
-        self.codec_ctx.*.height = rgb_frame.dimensions.height;
-    }
+    // Always sync codec dimensions with actual frame being encoded
+    self.codec_ctx.*.width = rgb_frame.dimensions.width;
+    self.codec_ctx.*.height = rgb_frame.dimensions.height;
 
     // Send frame to encoder
     if (c.avcodec_send_frame(self.codec_ctx, rgb_frame.raw_frame) < 0) {

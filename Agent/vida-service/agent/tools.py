@@ -12,15 +12,20 @@ from typing import Optional
 
 from bridge.ws_bridge import WebSocketBridge
 from config import MODEL_WIDTH, MODEL_HEIGHT
+from agent.calibration import get_calibrator
 
 logger = logging.getLogger(__name__)
 
-# Actual screen dimensions — set after first dimensions() call
+# Actual screen dimensions (gdigrab) — set after first dimensions() call
 _screen_w: Optional[int] = None
 _screen_h: Optional[int] = None
 
 
 def _to_screen(model_x: int, model_y: int) -> tuple[int, int]:
+    calibrator = get_calibrator()
+    if calibrator.is_calibrated:
+        return calibrator.to_screen(model_x, model_y)
+    # Fallback: use gdigrab dimensions directly (pre-calibration behavior)
     if _screen_w is None or _screen_h is None:
         return model_x, model_y
     x = int(model_x * _screen_w / MODEL_WIDTH)
@@ -29,6 +34,10 @@ def _to_screen(model_x: int, model_y: int) -> tuple[int, int]:
 
 
 def _to_model(screen_x: int, screen_y: int) -> tuple[int, int]:
+    calibrator = get_calibrator()
+    if calibrator.is_calibrated:
+        return calibrator.to_model(screen_x, screen_y)
+    # Fallback: use gdigrab dimensions directly
     if _screen_w is None or _screen_h is None:
         return screen_x, screen_y
     x = int(screen_x * MODEL_WIDTH / _screen_w)
@@ -37,7 +46,7 @@ def _to_model(screen_x: int, screen_y: int) -> tuple[int, int]:
 
 
 async def get_dimensions(bridge: WebSocketBridge) -> str:
-    """Get screen dimensions and cache them."""
+    """Get screen dimensions, cache them, and auto-calibrate if needed."""
     global _screen_w, _screen_h
     status, _, body = await bridge.send_request("GET", "computer/display/dimensions")
     if status != 200:
@@ -45,6 +54,16 @@ async def get_dimensions(bridge: WebSocketBridge) -> str:
     data = json.loads(body)
     _screen_w = data.get("width", MODEL_WIDTH)
     _screen_h = data.get("height", MODEL_HEIGHT)
+
+    # Auto-calibrate on first call or when gdigrab dimensions change
+    calibrator = get_calibrator()
+    if calibrator.needs_calibration(_screen_w, _screen_h):
+        fingerprint = getattr(bridge, '_piglet_fingerprint', '') or ''
+        try:
+            await calibrator.calibrate(bridge, _screen_w, _screen_h, fingerprint)
+        except Exception as e:
+            logger.error(f"Auto-calibration failed: {e}", exc_info=True)
+
     return f"Screen dimensions: {_screen_w}x{_screen_h}"
 
 
@@ -76,37 +95,32 @@ async def key_press(bridge: WebSocketBridge, combo: str) -> str:
     return "ok" if status == 200 else f"Error: status {status}"
 
 
+async def _click(bridge: WebSocketBridge, button: str, sx: int, sy: int) -> str:
+    """Send a full click (press + release) at screen coordinates."""
+    down = json.dumps({"button": button, "x": sx, "y": sy, "down": True}).encode()
+    up = json.dumps({"button": button, "x": sx, "y": sy, "down": False}).encode()
+    await bridge.send_request("POST", "computer/input/mouse/click", body=down)
+    status, _, _ = await bridge.send_request("POST", "computer/input/mouse/click", body=up)
+    return "ok" if status == 200 else f"Error: status {status}"
+
+
 async def left_click(bridge: WebSocketBridge, x: int, y: int) -> str:
     """Left-click at model coordinates."""
     sx, sy = _to_screen(x, y)
-    payload = json.dumps({"button": "left", "x": sx, "y": sy}).encode()
-    status, _, _ = await bridge.send_request(
-        "POST", "computer/input/mouse/click", body=payload
-    )
-    return "ok" if status == 200 else f"Error: status {status}"
+    return await _click(bridge, "left", sx, sy)
 
 
 async def right_click(bridge: WebSocketBridge, x: int, y: int) -> str:
     """Right-click at model coordinates."""
     sx, sy = _to_screen(x, y)
-    payload = json.dumps({"button": "right", "x": sx, "y": sy}).encode()
-    status, _, _ = await bridge.send_request(
-        "POST", "computer/input/mouse/click", body=payload
-    )
-    return "ok" if status == 200 else f"Error: status {status}"
+    return await _click(bridge, "right", sx, sy)
 
 
 async def double_click(bridge: WebSocketBridge, x: int, y: int) -> str:
     """Double-click at model coordinates."""
     sx, sy = _to_screen(x, y)
-    # First click
-    payload = json.dumps({"button": "left", "x": sx, "y": sy}).encode()
-    await bridge.send_request("POST", "computer/input/mouse/click", body=payload)
-    # Second click
-    status, _, _ = await bridge.send_request(
-        "POST", "computer/input/mouse/click", body=payload
-    )
-    return "ok" if status == 200 else f"Error: status {status}"
+    await _click(bridge, "left", sx, sy)
+    return await _click(bridge, "left", sx, sy)
 
 
 async def mouse_move(bridge: WebSocketBridge, x: int, y: int) -> str:
@@ -127,3 +141,30 @@ async def cursor_position(bridge: WebSocketBridge) -> str:
     data = json.loads(body)
     mx, my = _to_model(data["x"], data["y"])
     return f"Cursor at ({mx}, {my})"
+
+
+async def screenshot_region(bridge: WebSocketBridge, x: int, y: int, w: int, h: int) -> str:
+    """Take a screenshot of a specific screen region. Returns base64 PNG.
+
+    Coordinates are in native display space (not model space).
+    Much smaller payload than full screenshot — useful for screen detection.
+    """
+    path = f"computer/display/screenshot?x={x}&y={y}&w={w}&h={h}"
+    status, _, body = await bridge.send_request("GET", path, timeout=30.0)
+    if status != 200:
+        return f"Error taking region screenshot: status {status}"
+    return base64.b64encode(body).decode()
+
+
+async def powershell_exec(bridge: WebSocketBridge, command: str) -> dict:
+    """Execute a PowerShell command on the remote machine.
+
+    Returns: {"stdout": str, "stderr": str, "exitCode": int}
+    """
+    payload = json.dumps({"command": command}).encode()
+    status, _, body = await bridge.send_request(
+        "POST", "computer/shell/powershell/exec", body=payload, timeout=60.0
+    )
+    if status != 200:
+        return {"stdout": "", "stderr": f"Error: status {status}", "exitCode": -1}
+    return json.loads(body)

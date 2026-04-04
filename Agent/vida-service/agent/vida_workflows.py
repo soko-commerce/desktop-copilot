@@ -16,6 +16,8 @@ from typing import Optional
 
 from agent.vida_screens import VidaScreen
 from agent.screen_detector import ScreenDetector
+from agent.workflow_cache import WorkflowCache, WorkflowTrace, TraceStep
+from agent.screen_hash import compute_phash
 from agent import tools as bridge_tools
 from bridge.ws_bridge import WebSocketBridge
 
@@ -95,9 +97,11 @@ PART_SEARCH_WORKFLOW = [
 class WorkflowExecutor:
     """Executes scripted workflows against VIDA via the bridge."""
 
-    def __init__(self, bridge: WebSocketBridge, detector: ScreenDetector):
+    def __init__(self, bridge: WebSocketBridge, detector: ScreenDetector,
+                 cache: Optional[WorkflowCache] = None):
         self.bridge = bridge
         self.detector = detector
+        self.cache = cache
 
     async def execute_part_search(self, query: str) -> dict:
         """
@@ -122,6 +126,7 @@ class WorkflowExecutor:
             "screenshot_bytes": None,
             "used_fallback": False,
         }
+        trace_steps: list[TraceStep] = []
 
         for i, step in enumerate(steps):
             logger.info(f"Workflow step {i+1}/{len(steps)}: {step.action.value} -> {step.target}")
@@ -134,10 +139,11 @@ class WorkflowExecutor:
             current_screen = self.detector.detect_screen(screenshot_bytes)
             logger.info(f"  Current screen: {current_screen.value}, expected: {step.expect_screen.value}")
 
+            # Compute screen hash for trace recording
+            screen_hash = compute_phash(screenshot_bytes)
+
             # Check if we're on the expected screen
             if current_screen != step.expect_screen and current_screen != VidaScreen.UNKNOWN:
-                # We're on a known but unexpected screen — might be recoverable
-                # For now, mark as failed and let the caller decide to use Claude
                 result["failed_at_step"] = i
                 result["failure_reason"] = (
                     f"Expected {step.expect_screen.value}, got {current_screen.value}"
@@ -152,6 +158,16 @@ class WorkflowExecutor:
                 result["screenshot_bytes"] = screenshot_bytes
                 return result
 
+            # Get element coordinates for trace recording
+            target_x, target_y, text = None, None, None
+            if step.action == ActionType.CLICK:
+                elements = self.detector.get_elements(step.expect_screen)
+                el = elements.get(step.target)
+                if el:
+                    target_x, target_y = el["x"], el["y"]
+            elif step.action in (ActionType.TYPE, ActionType.KEY):
+                text = step.target
+
             # Execute the action
             try:
                 await self._execute_step(step, query)
@@ -159,6 +175,16 @@ class WorkflowExecutor:
                 result["failed_at_step"] = i
                 result["failure_reason"] = f"Action failed: {str(e)}"
                 return result
+
+            # Record trace step
+            trace_steps.append(TraceStep(
+                screen_hash=screen_hash,
+                action=step.action.value,
+                target_x=target_x,
+                target_y=target_y,
+                text=text,
+                timestamp=time.time(),
+            ))
 
             # Wait for UI to settle
             await asyncio.sleep(step.delay_after)
@@ -173,6 +199,21 @@ class WorkflowExecutor:
                 )
 
         result["success"] = True
+
+        # Save successful workflow trace for future replay
+        if self.cache and trace_steps:
+            screen_w = bridge_tools._screen_w or 1024
+            screen_h = bridge_tools._screen_h or 768
+            trace = WorkflowTrace(
+                workflow_type="part_search",
+                steps=trace_steps,
+                screen_width=screen_w,
+                screen_height=screen_h,
+                recorded_at=time.time(),
+                success=True,
+            )
+            self.cache.save_trace(trace)
+
         return result
 
     async def _execute_step(self, step: WorkflowStep, query: str):

@@ -5,21 +5,25 @@ VIDA AI agent — two execution modes:
    detection (perceptual hashing). Zero Claude calls on the happy path.
    Falls back to AI mode on unexpected screens.
 
-2. AI MODE (fallback): Full Claude vision agent with screenshot/click/type
-   tools via LangGraph. Used for recovery and result extraction.
+2. AI MODE (fallback): Vision agent with screenshot/click/type tools via
+   LangGraph. Supports both Anthropic Claude and Google Gemini.
 """
 
 import base64
 import logging
 from typing import Literal
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, MessagesState, END
 
 from bridge.ws_bridge import WebSocketBridge
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from config import (
+    AI_STRATEGY,
+    ANTHROPIC_API_KEY, ANTHROPIC_MODEL,
+    GEMINI_API_KEY, GEMINI_MODEL, GEMINI_TEMPERATURE,
+    AGENT_CONTEXT_WINDOW,
+)
 from agent import tools as bridge_tools
 from agent.vida_prompts import VIDA_SYSTEM_PROMPT
 from agent.screen_detector import ScreenDetector
@@ -41,6 +45,28 @@ def get_workflow_cache() -> WorkflowCache:
     return _workflow_cache
 
 
+def _build_llm():
+    """Build the LLM based on AI_STRATEGY config."""
+    if AI_STRATEGY == "gemini" and GEMINI_API_KEY:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        logger.info(f"Using Gemini model: {GEMINI_MODEL}")
+        return ChatGoogleGenerativeAI(
+            model=GEMINI_MODEL,
+            google_api_key=GEMINI_API_KEY,
+            temperature=GEMINI_TEMPERATURE,
+            max_output_tokens=4096,
+        )
+    else:
+        from langchain_anthropic import ChatAnthropic
+        logger.info(f"Using Anthropic model: {ANTHROPIC_MODEL}")
+        return ChatAnthropic(
+            model=ANTHROPIC_MODEL,
+            api_key=ANTHROPIC_API_KEY,
+            max_tokens=4096,
+            temperature=0.1,
+        )
+
+
 async def run_scripted_search(bridge: WebSocketBridge, query: str) -> dict:
     """
     Try the scripted workflow first (0 Claude calls on happy path).
@@ -53,21 +79,16 @@ async def run_scripted_search(bridge: WebSocketBridge, query: str) -> dict:
             "failure_reason": str | None,
         }
     """
-    executor = WorkflowExecutor(bridge, _screen_detector)
+    executor = WorkflowExecutor(bridge, _screen_detector, cache=_workflow_cache)
     return await executor.execute_part_search(query)
 
 
 async def extract_results_with_claude(screenshot_bytes: bytes, query: str) -> str:
     """
-    Use Claude vision on a SINGLE screenshot to extract parts data.
-    This is the one Claude call we make — reading the search results table.
+    Use vision LLM on a SINGLE screenshot to extract parts data.
+    This is the one LLM call we make — reading the search results table.
     """
-    llm = ChatAnthropic(
-        model=ANTHROPIC_MODEL,
-        api_key=ANTHROPIC_API_KEY,
-        max_tokens=4096,
-        temperature=0.0,
-    )
+    llm = _build_llm()
 
     b64 = base64.b64encode(screenshot_bytes).decode()
     messages = [
@@ -86,6 +107,26 @@ async def extract_results_with_claude(screenshot_bytes: bytes, query: str) -> st
 
     response = await llm.ainvoke(messages)
     return response.content if isinstance(response.content, str) else str(response.content)
+
+
+def _trim_messages(messages: list, window: int) -> list:
+    """
+    Keep only the system prompt + last `window` messages.
+    Drops old screenshots from context to prevent cost explosion.
+    """
+    if len(messages) <= window + 1:
+        return messages
+
+    # Always keep system message at index 0
+    system = []
+    rest = messages
+    if messages and isinstance(messages[0], SystemMessage):
+        system = [messages[0]]
+        rest = messages[1:]
+
+    # Keep only last `window` messages
+    trimmed = rest[-window:]
+    return system + trimmed
 
 
 def build_vida_agent(bridge: WebSocketBridge):
@@ -142,17 +183,16 @@ def build_vida_agent(bridge: WebSocketBridge):
     ]
     tool_map = {t.name: t for t in all_tools}
 
-    llm = ChatAnthropic(
-        model=ANTHROPIC_MODEL,
-        api_key=ANTHROPIC_API_KEY,
-        max_tokens=4096,
-        temperature=0.1,
-    ).bind_tools(all_tools)
+    llm = _build_llm().bind_tools(all_tools)
 
     async def call_model(state: MessagesState):
         messages = state["messages"]
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=VIDA_SYSTEM_PROMPT)] + messages
+
+        # Trim old messages to keep costs down
+        messages = _trim_messages(messages, AGENT_CONTEXT_WINDOW)
+
         response = await llm.ainvoke(messages)
         return {"messages": [response]}
 
@@ -167,6 +207,7 @@ def build_vida_agent(bridge: WebSocketBridge):
                 )
                 continue
             try:
+                logger.info(f"Tool call: {tc['name']}({tc['args']})")
                 result = await tool_fn.ainvoke(tc["args"])
                 if tc["name"] == "screenshot" and not result.startswith("Error"):
                     content = [

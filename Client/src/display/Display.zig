@@ -3,6 +3,7 @@
 const std = @import("std");
 const Capture = @import("Capture.zig");
 const Encoder = @import("Encoder.zig");
+const Frame = @import("Frame.zig");
 const Image = @import("Image.zig");
 
 const Display = @This();
@@ -30,6 +31,23 @@ pub fn screenshot(self: *Display, allocator: std.mem.Allocator, scale_options: E
     var frame = try self.capture.getFrame();
     defer frame.deinit();
     return try self.encoder.encode(frame, allocator, scale_options);
+}
+
+/// Capture a region of the screen as a PNG image.
+/// Coordinates are in native display space.
+pub fn screenshotRegion(self: *Display, allocator: std.mem.Allocator, x: c_int, y: c_int, w: c_int, h: c_int) !Image {
+    var frame = try self.capture.getFrame();
+    defer frame.deinit();
+
+    var cropped = try frame.crop(x, y, w, h);
+    defer cropped.deinit();
+
+    // Encode at native crop size (no additional scaling)
+    return try self.encoder.encode(cropped, allocator, .{
+        .width = w,
+        .height = h,
+        .mode = .Exact,
+    });
 }
 
 pub fn width(self: Display) u32 {

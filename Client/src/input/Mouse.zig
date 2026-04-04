@@ -116,6 +116,38 @@ pub fn move(mouse: *Mouse, target: Coordinates) !void {
     }
 }
 
+/// Move mouse instantly to target (no smooth interpolation).
+/// Saves ~100ms per move compared to smooth movement.
+pub fn moveInstant(mouse: *Mouse, target: Coordinates) !void {
+    if (target.x < 0 or target.x >= mouse.display_width or target.y < 0 or target.y >= mouse.display_height) {
+        return error.OutOfBounds;
+    }
+
+    const target_x = @as(i32, @intFromFloat(@as(f64, @floatFromInt(target.x)) * mouse.scale_x));
+    const target_y = @as(i32, @intFromFloat(@as(f64, @floatFromInt(target.y)) * mouse.scale_y));
+
+    var input = c.INPUT{
+        .type = c.INPUT_MOUSE,
+        .unnamed_0 = .{
+            .mi = .{
+                .dx = target_x,
+                .dy = target_y,
+                .mouseData = 0,
+                .dwFlags = c.MOUSEEVENTF_MOVE | c.MOUSEEVENTF_ABSOLUTE,
+                .time = 0,
+                .dwExtraInfo = 0,
+            },
+        },
+    };
+
+    if (c.SendInput(1, &input, @sizeOf(c.INPUT)) != 1) {
+        return error.SendInputFailed;
+    }
+
+    // Brief wait for cursor to arrive
+    std.time.sleep(1 * std.time.ns_per_ms);
+}
+
 pub const Button = enum {
     left,
     right,
@@ -147,6 +179,44 @@ pub fn click(mouse: *Mouse, button: Button, down: bool, target: Coordinates) !vo
             .mi = .{
                 .dx = 0, // No movement needed
                 .dy = 0, // No movement needed
+                .mouseData = 0,
+                .dwFlags = flags,
+                .time = 0,
+                .dwExtraInfo = 0,
+            },
+        },
+    };
+
+    if (c.SendInput(1, &input, @sizeOf(c.INPUT)) != 1) {
+        return error.SendInputFailed;
+    }
+}
+
+pub fn clickInstant(mouse: *Mouse, button: Button, down: bool, target: Coordinates) !void {
+    try mouse.moveInstant(target);
+
+    var flags: c_ulong = 0;
+    switch (button) {
+        .left => {
+            switch (down) {
+                true => flags = c.MOUSEEVENTF_LEFTDOWN,
+                false => flags = c.MOUSEEVENTF_LEFTUP,
+            }
+        },
+        .right => {
+            switch (down) {
+                true => flags = c.MOUSEEVENTF_RIGHTDOWN,
+                false => flags = c.MOUSEEVENTF_RIGHTUP,
+            }
+        },
+    }
+
+    var input = c.INPUT{
+        .type = c.INPUT_MOUSE,
+        .unnamed_0 = .{
+            .mi = .{
+                .dx = 0,
+                .dy = 0,
                 .mouseData = 0,
                 .dwFlags = flags,
                 .time = 0,

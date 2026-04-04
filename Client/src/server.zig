@@ -3,6 +3,7 @@ const Computer = @import("Computer.zig");
 const MouseButton = @import("input/Mouse.zig").Button;
 const Coordinates = @import("input/Mouse.zig").Coordinates;
 const httpz = @import("httpz"); // Note we use the version pinned to zig 0.13
+const win_c = @import("input/c.zig").c;
 
 const Deps = struct {
     computer: *Computer,
@@ -30,6 +31,7 @@ pub fn run(allocator: std.mem.Allocator, computer: *Computer, port: u16) !void {
     // Display endpoints
     router.get("/computer/display/screenshot", getScreenshot);
     router.get("/computer/display/dimensions", getDimensions);
+    router.get("/computer/display/metrics", getDisplayMetrics);
 
     // Input endpoints
     // Keyboard
@@ -66,13 +68,43 @@ fn notImplemented(_: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{}, .{});
 }
 
-fn getScreenshot(deps: *Deps, _: *httpz.Request, res: *httpz.Response) !void {
-    // todo: allow specifying size and format
-    const image = try deps.computer.display.screenshot(res.arena, .{
-        .width = 1024,
-        .height = 768,
-        .mode = .Exact, // strongly recommended to stick with this for Claude
-    });
+fn getScreenshot(deps: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
+    // Check for region crop parameters
+    const x_str = req.query("x");
+    const y_str = req.query("y");
+    const w_str = req.query("w");
+    const h_str = req.query("h");
+
+    const image = if (x_str != null and y_str != null and w_str != null and h_str != null) blk: {
+        const x = std.fmt.parseInt(c_int, x_str.?, 10) catch {
+            res.status = 400;
+            try res.json(.{ .@"error" = "invalid x parameter" }, .{});
+            return;
+        };
+        const y = std.fmt.parseInt(c_int, y_str.?, 10) catch {
+            res.status = 400;
+            try res.json(.{ .@"error" = "invalid y parameter" }, .{});
+            return;
+        };
+        const w = std.fmt.parseInt(c_int, w_str.?, 10) catch {
+            res.status = 400;
+            try res.json(.{ .@"error" = "invalid w parameter" }, .{});
+            return;
+        };
+        const h = std.fmt.parseInt(c_int, h_str.?, 10) catch {
+            res.status = 400;
+            try res.json(.{ .@"error" = "invalid h parameter" }, .{});
+            return;
+        };
+        break :blk try deps.computer.display.screenshotRegion(res.arena, x, y, w, h);
+    } else blk: {
+        break :blk try deps.computer.display.screenshot(res.arena, .{
+            .width = 1024,
+            .height = 768,
+            .mode = .Exact,
+        });
+    };
+
     res.status = 200;
     res.header("Content-Type", "image/png");
     try res.writer().writeAll(image.bytes);
@@ -83,6 +115,28 @@ fn getDimensions(deps: *Deps, _: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{
         .width = deps.computer.display.width(),
         .height = deps.computer.display.height(),
+    }, .{});
+}
+
+fn getDisplayMetrics(deps: *Deps, _: *httpz.Request, res: *httpz.Response) !void {
+    // System metrics via user32.dll GetSystemMetrics — no privileges needed
+    const SM_CXSCREEN = 0; // Primary monitor logical width
+    const SM_CYSCREEN = 1; // Primary monitor logical height
+    const SM_CXVIRTUALSCREEN = 78; // Virtual screen width (all monitors)
+    const SM_CYVIRTUALSCREEN = 79; // Virtual screen height
+    const SM_XVIRTUALSCREEN = 76; // Virtual screen left edge
+    const SM_YVIRTUALSCREEN = 77; // Virtual screen top edge
+
+    res.status = 200;
+    try res.json(.{
+        .pw = win_c.GetSystemMetrics(SM_CXSCREEN),
+        .ph = win_c.GetSystemMetrics(SM_CYSCREEN),
+        .vw = win_c.GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        .vh = win_c.GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        .vx = win_c.GetSystemMetrics(SM_XVIRTUALSCREEN),
+        .vy = win_c.GetSystemMetrics(SM_YVIRTUALSCREEN),
+        .gdigrab_w = deps.computer.display.width(),
+        .gdigrab_h = deps.computer.display.height(),
     }, .{});
 }
 
@@ -116,12 +170,12 @@ fn getMousePosition(deps: *Deps, _: *httpz.Request, res: *httpz.Response) !void 
     }, .{});
 }
 
-const MouseMovePayload = struct { x: i32, y: i32 };
+const MouseMovePayload = struct { x: i32, y: i32, instant: bool = false };
 const ButtonEnum = enum {
     left,
     right,
 };
-const MouseClickPayload = struct { x: ?i32 = null, y: ?i32 = null, button: ButtonEnum, down: bool };
+const MouseClickPayload = struct { x: ?i32 = null, y: ?i32 = null, button: ButtonEnum, down: bool, instant: bool = false };
 
 fn postMouseMove(deps: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
     const body = try req.json(MouseMovePayload) orelse {
@@ -129,7 +183,11 @@ fn postMouseMove(deps: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
         try res.json(.{}, .{});
         return;
     };
-    try deps.computer.mouse.move(.{ .x = body.x, .y = body.y });
+    if (body.instant) {
+        try deps.computer.mouse.moveInstant(.{ .x = body.x, .y = body.y });
+    } else {
+        try deps.computer.mouse.move(.{ .x = body.x, .y = body.y });
+    }
 }
 
 fn postMouseClick(deps: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
@@ -150,7 +208,11 @@ fn postMouseClick(deps: *Deps, req: *httpz.Request, res: *httpz.Response) !void 
         .left => MouseButton.left,
         .right => MouseButton.right,
     };
-    try deps.computer.mouse.click(button, body.down, target);
+    if (body.instant) {
+        try deps.computer.mouse.clickInstant(button, body.down, target);
+    } else {
+        try deps.computer.mouse.click(button, body.down, target);
+    }
 }
 
 fn getFsList(_: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
@@ -165,10 +227,70 @@ fn postFsWrite(_: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
     try notImplemented(req, res);
 }
 
+const ShellPayload = struct { command: []const u8 };
+
 fn postHandleCMDExec(_: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
-    try notImplemented(req, res);
+    const body = try req.json(ShellPayload) orelse {
+        res.status = 400;
+        try res.json(.{ .@"error" = "missing command field" }, .{});
+        return;
+    };
+
+    var child = std.process.Child.init(
+        &.{ "cmd.exe", "/C", body.command },
+        res.arena,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    const stdout = try child.stdout.?.reader().readAllAlloc(res.arena, 1024 * 1024);
+    const stderr = try child.stderr.?.reader().readAllAlloc(res.arena, 1024 * 1024);
+    const term = try child.wait();
+
+    const exit_code: i32 = switch (term) {
+        .Exited => |code| @as(i32, @intCast(code)),
+        else => -1,
+    };
+
+    res.status = 200;
+    try res.json(.{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exitCode = exit_code,
+    }, .{});
 }
 
 fn postHandlePowerShellExec(_: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
-    try notImplemented(req, res);
+    const body = try req.json(ShellPayload) orelse {
+        res.status = 400;
+        try res.json(.{ .@"error" = "missing command field" }, .{});
+        return;
+    };
+
+    var child = std.process.Child.init(
+        &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", body.command },
+        res.arena,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    const stdout = try child.stdout.?.reader().readAllAlloc(res.arena, 1024 * 1024);
+    const stderr = try child.stderr.?.reader().readAllAlloc(res.arena, 1024 * 1024);
+    const term = try child.wait();
+
+    const exit_code: i32 = switch (term) {
+        .Exited => |code| @as(i32, @intCast(code)),
+        else => -1,
+    };
+
+    res.status = 200;
+    try res.json(.{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exitCode = exit_code,
+    }, .{});
 }
