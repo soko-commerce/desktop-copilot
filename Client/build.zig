@@ -1,6 +1,9 @@
 const std = @import("std");
 
 // Zig 0.13.0 required.
+// Windows native build requires MSYS2 MinGW64 with ffmpeg and x264 packages:
+//   pacman -S mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-x264
+// After build, copy DLLs from C:\msys64\mingw64\bin\ next to piglet.exe
 
 pub fn build(b: *std.Build) void {
     const version = "0.0.7";
@@ -35,19 +38,15 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addOptions("build_config", build_options);
 
-    // Add FFmpeg include and lib paths (from vendor directory)
+    // FFmpeg headers (tracked in vendor/)
     exe.addSystemIncludePath(b.path("vendor/ffmpeg/include"));
     exe.addSystemIncludePath(b.path("vendor/ffmpeg/include/ffmpeg"));
-    exe.addLibraryPath(b.path("vendor/ffmpeg/lib"));
-
-    // Additional vendor lib path for x264, winpthread, etc.
-    exe.addLibraryPath(b.path("vendor/lib"));
 
     const host_os = @import("builtin").os.tag;
     const target_info = target.result;
 
     if (host_os == .windows) {
-        // Native Windows build — use MSYS2 MinGW64 paths if available
+        // Native Windows build — MSYS2 MinGW64
         exe.addSystemIncludePath(.{ .cwd_relative = "C:/msys64/mingw64/include" });
         exe.addLibraryPath(.{ .cwd_relative = "C:/msys64/mingw64/lib" });
     } else {
@@ -79,11 +78,6 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("ws2_32");
         exe.linkSystemLibrary("secur32");
         exe.linkSystemLibrary("crypt32");
-        exe.linkSystemLibrary("ssl");
-        exe.linkSystemLibrary("crypto");
-
-        // winpthread — try vendor/lib first, fall back to system paths
-        exe.linkSystemLibrary("winpthread");
 
         // Define Windows threading model to match FFmpeg build
         exe.defineCMacro("WIN32_LEAN_AND_MEAN", null);
@@ -91,21 +85,37 @@ pub fn build(b: *std.Build) void {
         exe.defineCMacro("PTWS32_STATIC_LIB", "1");
         exe.defineCMacro("_WIN32_WINNT", "0x0601");
 
-        // Third-party libraries
-        exe.linkSystemLibrary("z");
-        exe.linkSystemLibrary("x264");
+        // Third-party libs + FFmpeg — use dynamic linking on native Windows
+        // to avoid pulling in the entire MSYS2 static dependency tree
+        const dynamic = .{ .preferred_link_mode = .dynamic };
+        exe.linkSystemLibrary2("ssl", dynamic);
+        exe.linkSystemLibrary2("crypto", dynamic);
+        exe.linkSystemLibrary2("winpthread", dynamic);
+        exe.linkSystemLibrary2("z", dynamic);
+        exe.linkSystemLibrary2("x264", dynamic);
+        exe.linkSystemLibrary2("stdc++", dynamic);
         exe.linkSystemLibrary("d3d11");
-        exe.linkSystemLibrary("stdc++");
-    }
 
-    // Link FFmpeg static libraries
-    exe.linkSystemLibrary("avcodec");
-    exe.linkSystemLibrary("avfilter");
-    exe.linkSystemLibrary("avdevice");
-    exe.linkSystemLibrary("avformat");
-    exe.linkSystemLibrary("avutil");
-    exe.linkSystemLibrary("swresample");
-    exe.linkSystemLibrary("swscale");
+        // FFmpeg (dynamic on Windows)
+        exe.linkSystemLibrary2("avcodec", dynamic);
+        exe.linkSystemLibrary2("avfilter", dynamic);
+        exe.linkSystemLibrary2("avdevice", dynamic);
+        exe.linkSystemLibrary2("avformat", dynamic);
+        exe.linkSystemLibrary2("avutil", dynamic);
+        exe.linkSystemLibrary2("swresample", dynamic);
+        exe.linkSystemLibrary2("swscale", dynamic);
+    } else {
+        // Cross-compile: static linking (macOS/Linux host)
+        exe.linkSystemLibrary("ssl");
+        exe.linkSystemLibrary("crypto");
+        exe.linkSystemLibrary("avcodec");
+        exe.linkSystemLibrary("avfilter");
+        exe.linkSystemLibrary("avdevice");
+        exe.linkSystemLibrary("avformat");
+        exe.linkSystemLibrary("avutil");
+        exe.linkSystemLibrary("swresample");
+        exe.linkSystemLibrary("swscale");
+    }
 
     b.installArtifact(exe);
 
