@@ -70,10 +70,11 @@ fn notImplemented(_: *httpz.Request, res: *httpz.Response) !void {
 
 fn getScreenshot(deps: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
     // Check for region crop parameters
-    const x_str = req.query("x");
-    const y_str = req.query("y");
-    const w_str = req.query("w");
-    const h_str = req.query("h");
+    const qs = try req.query();
+    const x_str = qs.get("x");
+    const y_str = qs.get("y");
+    const w_str = qs.get("w");
+    const h_str = qs.get("h");
 
     const image = if (x_str != null and y_str != null and w_str != null and h_str != null) blk: {
         const x = std.fmt.parseInt(c_int, x_str.?, 10) catch {

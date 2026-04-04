@@ -95,6 +95,7 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("z");
         exe.linkSystemLibrary("x264");
         exe.linkSystemLibrary("d3d11");
+        exe.linkSystemLibrary("stdc++");
     }
 
     // Link FFmpeg static libraries

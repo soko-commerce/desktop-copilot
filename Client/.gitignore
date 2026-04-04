@@ -8,5 +8,6 @@ zig-out/
 /docgen_tmp/
 
 
-# Vendor directory is tracked — contains build dependencies for Windows cross-compile
-# /vendor/
+# Vendor headers are tracked; static libraries come from MSYS2 on Windows
+/vendor/ffmpeg/lib/
+/vendor/lib/
