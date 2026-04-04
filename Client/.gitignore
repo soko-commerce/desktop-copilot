@@ -8,4 +8,5 @@ zig-out/
 /docgen_tmp/
 
 
-/vendor/
+# Vendor directory is tracked — contains build dependencies for Windows cross-compile
+# /vendor/

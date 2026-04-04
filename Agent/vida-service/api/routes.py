@@ -155,9 +155,9 @@ async def search_direct(req: SearchPartsRequest):
         raise HTTPException(503, "No piglet connected — cannot control VIDA")
 
     start = time.time()
-    logger.info(f"Direct search: query='{req.query}', vin='{req.vin}'")
+    logger.info(f"Direct search: query='{req.query}', vin='{req.vin}', model='{req.model}', year='{req.year}'")
 
-    result = await direct_part_search(bridge, req.query, req.vin)
+    result = await direct_part_search(bridge, req.query, req.vin, req.model, req.year)
 
     elapsed = time.time() - start
     logger.info(f"Direct search completed in {elapsed:.1f}s — "

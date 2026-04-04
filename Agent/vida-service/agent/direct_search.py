@@ -1,14 +1,14 @@
 """
-Direct VIDA search — deterministic flow with 2-3 Claude vision calls.
+Direct VIDA search — deterministic flow with 2-4 Claude vision calls.
 
-Instead of an agent loop (10-30 calls), this module:
-1. Takes a screenshot
-2. Asks Claude: "What screen is this? Where are the UI elements?" (1 call)
-3. Executes a fixed click/type sequence based on the detected screen
-4. Takes a final screenshot
-5. Asks Claude: "Extract the parts data from this results screen" (1 call)
+Workflow (per user specification):
+1. Navigate to "Search Vehicle" page
+2. Click "Clear All" to reset all fields
+3. Fill in provided fields (VIN, model, year, etc.)
+4. Click Search/Select
+5. Extract results with Claude OCR
 
-Total: 2-3 Claude calls per search.
+Total: 2-4 Claude calls per search (detect screen + optional re-detect + extract).
 """
 
 import asyncio
@@ -24,40 +24,40 @@ from agent.vida_agent import _build_llm, extract_results_with_claude
 logger = logging.getLogger(__name__)
 
 DETECT_SCREEN_PROMPT = """You are analyzing a 1024x768 screenshot of a Windows desktop.
-The VIDA application (Volvo diagnostic software) is in the TOP PORTION of the screen.
+The VIDA application (Volvo diagnostic software) occupies the top ~52% of the screen.
 
-Look at the screenshot and tell me:
-1. What VIDA screen/state is currently showing?
-2. The EXACT pixel coordinates (x, y) of key UI elements visible in the screenshot.
+Identify the VIDA screen state and provide EXACT pixel coordinates for visible UI elements.
 
 Possible screens:
-- "home": VIDA home screen / Search Customer Vehicle Profile with VIN fields
-- "vehicle_selected": A vehicle is loaded, showing vehicle details and Quick Links
-- "search_vehicle": The search/fine-tune vehicle form
-- "parts_catalog": Parts catalog or search page
-- "search_results": Search results showing parts list/table
-- "menu_open": A dropdown menu or hamburger menu is open
-- "popup": A popup/dialog/modal is blocking (e.g., Release Notes)
-- "unknown": Can't determine
+- "search_vehicle": The "Search Customer Vehicle Profile" page with empty/clearable fields
+  (VIN, Model, Year, Partner Group, Engine, Transmission, Steering, Body Style, Special Vehicle).
+  Has "Search" and "Clear All" buttons at bottom.
+- "fine_tune": The "Fine-tune Vehicle" page — appears after a vehicle is identified.
+  Similar fields but pre-filled. Has "Clear All" and "Select" buttons.
+- "vehicle_selected": A vehicle is loaded, showing Quick Links and vehicle details.
+- "parts_catalog": Parts catalog or search results page.
+- "popup": A popup/dialog/modal is blocking (e.g., Release Notes).
+- "unknown": Can't determine.
 
-For each visible element, provide its CENTER coordinates in the 1024x768 image:
-- "vin_field": The VIN text input field
-- "search_button": Search or magnifying glass icon button
-- "clear_all": Clear All button
-- "select_button": Select button
-- "hamburger_menu": Menu/hamburger icon
-- "search_field": Parts search/filter text field
-- "close_popup": X button or close for any popup
-- "search_vehicle_tab": "Search Vehicle" navigation link
-- "home_tab": Home tab
-- "parts_catalog_link": Any link to Parts Catalog
-- "popup_close_area": Area to click to dismiss a popup
+For each VISIBLE element, provide its CENTER coordinates in the 1024x768 image:
+- "search_vehicle_tab": "Search Vehicle" text link in the top navigation bar
+- "vin_field": The VIN text input field (the main text box, not the label)
+- "vin_type_dropdown": The VIN type dropdown (next to VIN field, e.g. "Chassis No")
+- "model_field": The Model dropdown/field
+- "year_field": The Year dropdown/field
+- "partner_group_field": The Partner Group dropdown
+- "search_button": "Search" button (magnifying glass or text)
+- "clear_all_button": "Clear All" button
+- "select_button": "Select" button
+- "close_popup": X button to close any popup/dialog
+- "see_vehicle_details": "See Vehicle Details" link
+- "hamburger_menu": Menu/hamburger icon in toolbar
 
-Only include elements you can actually see. Be precise with coordinates — they will be used for mouse clicks.
+Only include elements you can ACTUALLY SEE. Be precise — coordinates will be used for mouse clicks.
 
 Respond with ONLY this JSON (no other text):
 {
-  "screen": "home|vehicle_selected|search_vehicle|parts_catalog|search_results|menu_open|popup|unknown",
+  "screen": "search_vehicle|fine_tune|vehicle_selected|parts_catalog|popup|unknown",
   "elements": {
     "element_name": {"x": 123, "y": 456},
     ...
@@ -71,14 +71,11 @@ async def detect_screen(bridge: WebSocketBridge) -> tuple[dict, bytes]:
 
     Returns (detection_result, screenshot_bytes).
     """
-    # Ensure dimensions are loaded
     await bridge_tools.get_dimensions(bridge)
 
-    # Take screenshot
     ss_b64 = await bridge_tools.screenshot(bridge)
     ss_bytes = base64.b64decode(ss_b64)
 
-    # Ask Claude to detect screen state
     llm = _build_llm()
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -93,9 +90,7 @@ async def detect_screen(bridge: WebSocketBridge) -> tuple[dict, bytes]:
     response = await llm.ainvoke(messages)
     text = response.content if isinstance(response.content, str) else str(response.content)
 
-    # Parse JSON from response
     try:
-        # Handle markdown code blocks
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -111,11 +106,7 @@ async def detect_screen(bridge: WebSocketBridge) -> tuple[dict, bytes]:
 
 async def click_element(bridge: WebSocketBridge, elements: dict, name: str,
                         fallback_x: int = 0, fallback_y: int = 0) -> bool:
-    """Click a named element using coordinates from Claude's detection.
-
-    Uses model coordinates (1024x768 space) which go through _to_screen().
-    Falls back to provided defaults if element not found.
-    """
+    """Click a named element using coordinates from Claude's detection."""
     el = elements.get(name)
     if el:
         x, y = el["x"], el["y"]
@@ -137,83 +128,89 @@ async def dismiss_popup(bridge: WebSocketBridge, elements: dict) -> bool:
         await click_element(bridge, elements, "close_popup")
         await asyncio.sleep(0.5)
         return True
-    # Try Escape
     await bridge_tools.key_press(bridge, "Escape")
     await asyncio.sleep(0.5)
     return True
 
 
-async def navigate_to_search(bridge: WebSocketBridge, detection: dict, max_retries: int = 3) -> dict:
-    """Navigate VIDA to a state where we can search for parts.
+async def go_to_search_vehicle(bridge: WebSocketBridge, detection: dict,
+                                max_retries: int = 3) -> tuple[dict, int]:
+    """Navigate to the Search Vehicle page and return detection + Claude calls used.
 
-    Returns the final screen detection result.
+    Returns (detection_result, extra_claude_calls).
     """
+    claude_calls = 0
+
     for attempt in range(max_retries):
         screen = detection.get("screen", "unknown")
         elements = detection.get("elements", {})
 
-        logger.info(f"Navigate attempt {attempt+1}: screen={screen}")
+        logger.info(f"Navigation attempt {attempt+1}: screen={screen}")
 
+        # Handle popups first
         if screen == "popup":
             await dismiss_popup(bridge, elements)
             detection, _ = await detect_screen(bridge)
+            claude_calls += 1
             continue
 
-        if screen == "search_results":
-            # Already on search results — good to go
-            return detection
+        # Already on search_vehicle — ready
+        if screen == "search_vehicle":
+            return detection, claude_calls
 
-        if screen == "parts_catalog":
-            # Already on parts catalog — good to go
-            return detection
+        # On fine_tune or any other screen — click "Search Vehicle" tab to go to clean search
+        if elements.get("search_vehicle_tab"):
+            logger.info("Clicking 'Search Vehicle' tab to navigate to search page")
+            await click_element(bridge, elements, "search_vehicle_tab")
+            await asyncio.sleep(1.5)
+            detection, _ = await detect_screen(bridge)
+            claude_calls += 1
+            continue
 
-        if screen in ("home", "vehicle_selected", "search_vehicle"):
-            # Try to find parts catalog or search
-            if elements.get("parts_catalog_link"):
-                await click_element(bridge, elements, "parts_catalog_link")
-                await asyncio.sleep(2)
-                detection, _ = await detect_screen(bridge)
-                continue
-
-            if elements.get("hamburger_menu"):
-                await click_element(bridge, elements, "hamburger_menu")
-                await asyncio.sleep(1)
-                detection, _ = await detect_screen(bridge)
-                continue
-
-            if elements.get("search_button"):
-                await click_element(bridge, elements, "search_button")
-                await asyncio.sleep(1)
-                detection, _ = await detect_screen(bridge)
-                continue
-
-            # If we're on search_vehicle with VIN field, we can search here
-            if screen == "search_vehicle" and elements.get("vin_field"):
-                return detection
-
-            # If on home with VIN field, we can start from here
-            if elements.get("vin_field"):
-                return detection
-
-        if screen == "menu_open":
-            if elements.get("parts_catalog_link"):
-                await click_element(bridge, elements, "parts_catalog_link")
-                await asyncio.sleep(2)
-                detection, _ = await detect_screen(bridge)
-                continue
-
-        # If we can't figure out what to do, try clicking away
-        await bridge_tools.key_press(bridge, "Escape")
-        await asyncio.sleep(0.5)
+        # Fallback: click "Search Vehicle" tab at known approximate position
+        # From screenshots: "Search Vehicle" text is at roughly x=20, y=35 in 1024x768
+        logger.info("Using fallback click on 'Search Vehicle' tab area")
+        await bridge_tools.left_click(bridge, 20, 35)
+        await asyncio.sleep(1.5)
         detection, _ = await detect_screen(bridge)
+        claude_calls += 1
 
-    return detection
+    logger.warning(f"Could not navigate to search_vehicle after {max_retries} attempts")
+    return detection, claude_calls
+
+
+async def fill_field(bridge: WebSocketBridge, elements: dict,
+                     field_name: str, value: str) -> bool:
+    """Click a field, clear it, and type a value."""
+    if not value:
+        return False
+
+    el = elements.get(field_name)
+    if not el:
+        logger.warning(f"Field '{field_name}' not found in detected elements")
+        return False
+
+    logger.info(f"Filling '{field_name}' with '{value}'")
+    await click_element(bridge, elements, field_name)
+    await asyncio.sleep(0.3)
+    # Select all existing text and replace
+    await bridge_tools.key_press(bridge, "ctrl+a")
+    await asyncio.sleep(0.2)
+    await bridge_tools.type_text(bridge, value)
+    await asyncio.sleep(0.3)
+    return True
 
 
 async def execute_part_search(bridge: WebSocketBridge, query: str,
-                              vin: str = "") -> dict:
+                              vin: str = "", model: str = "",
+                              year: str = "") -> dict:
     """
-    Execute a direct VIDA part search with 2-3 Claude vision calls.
+    Execute a direct VIDA vehicle search following the user's workflow:
+    1. Navigate to Search Vehicle page
+    2. Click Clear All
+    3. Fill in provided fields (VIN, model, year)
+    4. Click Search/Select
+    5. Extract results
 
     Returns:
         {
@@ -235,78 +232,100 @@ async def execute_part_search(bridge: WebSocketBridge, query: str,
     }
 
     try:
-        # Step 1: Detect current screen (1 Claude call)
-        logger.info(f"Direct search starting: query='{query}', vin='{vin}'")
+        # --- Step 1: Detect current screen ---
+        logger.info(f"Direct search starting: query='{query}', vin='{vin}', model='{model}', year='{year}'")
         detection, ss_bytes = await detect_screen(bridge)
         result["claude_calls"] += 1
         result["steps_taken"] += 1
 
+        # --- Step 2: Navigate to Search Vehicle page ---
+        detection, nav_calls = await go_to_search_vehicle(bridge, detection)
+        result["claude_calls"] += nav_calls
+        result["steps_taken"] += nav_calls
+
         screen = detection.get("screen", "unknown")
         elements = detection.get("elements", {})
 
-        # Step 2: Handle popups
-        if screen == "popup":
-            await dismiss_popup(bridge, elements)
+        if screen not in ("search_vehicle", "fine_tune"):
+            result["error"] = f"Failed to navigate to search page (stuck on '{screen}')"
+            logger.error(result["error"])
+            return result
+
+        # --- Step 3: Click Clear All ---
+        if elements.get("clear_all_button"):
+            logger.info("Clicking 'Clear All' to reset fields")
+            await click_element(bridge, elements, "clear_all_button")
+            await asyncio.sleep(1.0)
+            result["steps_taken"] += 1
+
+            # Re-detect after clear to get fresh element positions
             detection, ss_bytes = await detect_screen(bridge)
             result["claude_calls"] += 1
             result["steps_taken"] += 1
-            screen = detection.get("screen", "unknown")
             elements = detection.get("elements", {})
+        else:
+            logger.warning("'Clear All' button not found — proceeding with current field state")
 
-        # Step 3: Navigate to a searchable state if needed
-        if screen not in ("parts_catalog", "search_results"):
-            detection = await navigate_to_search(bridge, detection)
-            screen = detection.get("screen", "unknown")
-            elements = detection.get("elements", {})
+        # --- Step 4: Fill in provided fields ---
+        fields_filled = 0
 
-        # Step 4: If we have a VIN and we're on a screen with VIN field, enter it
-        if vin and elements.get("vin_field"):
-            logger.info(f"Entering VIN: {vin}")
-            await click_element(bridge, elements, "vin_field")
-            await asyncio.sleep(0.3)
-            await bridge_tools.key_press(bridge, "ctrl+a")
-            await asyncio.sleep(0.2)
-            await bridge_tools.type_text(bridge, vin)
-            await asyncio.sleep(0.3)
-            result["steps_taken"] += 3
+        if vin:
+            if await fill_field(bridge, elements, "vin_field", vin):
+                fields_filled += 1
+                result["steps_taken"] += 3
+                # Tab out of VIN field to trigger any auto-lookup
+                await bridge_tools.key_press(bridge, "Tab")
+                await asyncio.sleep(0.5)
 
-        # Step 5: If we have a search field, enter the query
-        if elements.get("search_field"):
-            logger.info(f"Entering search query: {query}")
-            await click_element(bridge, elements, "search_field")
-            await asyncio.sleep(0.3)
-            await bridge_tools.key_press(bridge, "ctrl+a")
-            await asyncio.sleep(0.2)
-            await bridge_tools.type_text(bridge, query)
-            await asyncio.sleep(0.3)
-            await bridge_tools.key_press(bridge, "Return")
-            await asyncio.sleep(2)  # Wait for search results
-            result["steps_taken"] += 4
+        if model:
+            if await fill_field(bridge, elements, "model_field", model):
+                fields_filled += 1
+                result["steps_taken"] += 3
+
+        if year:
+            if await fill_field(bridge, elements, "year_field", year):
+                fields_filled += 1
+                result["steps_taken"] += 3
+
+        if fields_filled == 0 and not query:
+            result["error"] = "No fields to fill — provide VIN, model, year, or query"
+            logger.error(result["error"])
+            return result
+
+        logger.info(f"Filled {fields_filled} fields")
+
+        # --- Step 5: Click Search or Select ---
+        clicked_action = False
+        if elements.get("search_button"):
+            logger.info("Clicking 'Search' button")
+            await click_element(bridge, elements, "search_button")
+            clicked_action = True
         elif elements.get("select_button"):
-            # On vehicle search page — click Select to load vehicle first
-            logger.info("Clicking Select to load vehicle")
+            logger.info("Clicking 'Select' button")
             await click_element(bridge, elements, "select_button")
-            await asyncio.sleep(3)
-            result["steps_taken"] += 1
-            # Re-detect screen after selection
-            detection, ss_bytes = await detect_screen(bridge)
-            result["claude_calls"] += 1
-            screen = detection.get("screen", "unknown")
-            elements = detection.get("elements", {})
+            clicked_action = True
+        else:
+            # Try pressing Enter as fallback
+            logger.info("No Search/Select button found — pressing Enter")
+            await bridge_tools.key_press(bridge, "Return")
+            clicked_action = True
 
-        # Step 6: Take final screenshot and extract results
+        if clicked_action:
+            result["steps_taken"] += 1
+            await asyncio.sleep(3)  # Wait for VIDA to process
+
+        # --- Step 6: Take final screenshot and extract results ---
         logger.info("Taking final screenshot for result extraction")
         final_b64 = await bridge_tools.screenshot(bridge)
         final_bytes = base64.b64decode(final_b64)
         result["steps_taken"] += 1
 
-        # Step 7: Extract results with Claude OCR (1 Claude call)
+        # --- Step 7: Extract results with Claude OCR ---
         logger.info("Extracting results with Claude vision")
         raw_text = await extract_results_with_claude(final_bytes, query)
         result["claude_calls"] += 1
         result["raw_response"] = raw_text
 
-        # Parse results
         from agent.result_parser import parse_agent_response
         parts_data = parse_agent_response(raw_text)
         result["parts"] = parts_data

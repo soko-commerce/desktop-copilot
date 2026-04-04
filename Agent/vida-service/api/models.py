@@ -6,6 +6,8 @@ from pydantic import BaseModel
 class SearchPartsRequest(BaseModel):
     query: str
     vin: str = ""
+    model: str = ""
+    year: str = ""
     max_steps: int = 50
 
 

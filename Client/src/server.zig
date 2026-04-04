@@ -113,8 +113,10 @@ fn getScreenshot(deps: *Deps, req: *httpz.Request, res: *httpz.Response) !void {
 fn getDimensions(deps: *Deps, _: *httpz.Request, res: *httpz.Response) !void {
     res.status = 200;
     try res.json(.{
-        .width = deps.computer.display.width(),
-        .height = deps.computer.display.height(),
+        .width = deps.computer.mouse.input_width,
+        .height = deps.computer.mouse.input_height,
+        .capture_width = deps.computer.display.width(),
+        .capture_height = deps.computer.display.height(),
     }, .{});
 }
 

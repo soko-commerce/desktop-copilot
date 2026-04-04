@@ -16,9 +16,12 @@ from agent.calibration import get_calibrator
 
 logger = logging.getLogger(__name__)
 
-# Actual screen dimensions (gdigrab) — set after first dimensions() call
+# Input dimensions — what piglet's Mouse accepts (SM_CXSCREEN on new piglet, gdigrab on old)
 _screen_w: Optional[int] = None
 _screen_h: Optional[int] = None
+# Capture dimensions (gdigrab physical pixels) — for screenshot scaling context
+_capture_w: Optional[int] = None
+_capture_h: Optional[int] = None
 
 
 def _to_screen(model_x: int, model_y: int) -> tuple[int, int]:
@@ -47,13 +50,18 @@ def _to_model(screen_x: int, screen_y: int) -> tuple[int, int]:
 
 async def get_dimensions(bridge: WebSocketBridge) -> str:
     """Get screen dimensions, cache them, and auto-calibrate if needed."""
-    global _screen_w, _screen_h
+    global _screen_w, _screen_h, _capture_w, _capture_h
     status, _, body = await bridge.send_request("GET", "computer/display/dimensions")
     if status != 200:
         return f"Error: status {status}"
     data = json.loads(body)
+    # New piglet: width/height = SM_CXSCREEN (logical input target),
+    #             capture_width/capture_height = gdigrab physical pixels
+    # Old piglet: width/height = gdigrab dimensions (no capture_* fields)
     _screen_w = data.get("width", MODEL_WIDTH)
     _screen_h = data.get("height", MODEL_HEIGHT)
+    _capture_w = data.get("capture_width", _screen_w)
+    _capture_h = data.get("capture_height", _screen_h)
 
     # Auto-calibrate on first call or when gdigrab dimensions change
     calibrator = get_calibrator()

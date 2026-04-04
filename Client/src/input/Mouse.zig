@@ -11,15 +11,30 @@ pub const Coordinates = struct {
 
 scale_x: f64, // SendInput uses a scale factor for 0-65535 range
 scale_y: f64,
-display_width: u32,
+display_width: u32, // gdigrab capture dimensions (physical pixels)
 display_height: u32,
+input_width: u32, // SendInput target space (SM_CXSCREEN, logical pixels)
+input_height: u32,
 
 pub fn new(display_width: u32, display_height: u32) Mouse {
+    // SendInput ABSOLUTE mode maps 0-65535 to the primary monitor's logical dimensions
+    // (SM_CXSCREEN x SM_CYSCREEN), NOT the physical/gdigrab dimensions.
+    // On high-DPI displays, gdigrab captures physical pixels (e.g., 3840x2160) but
+    // SendInput targets the logical resolution (e.g., 1920x1080 at 200% DPI).
+    const sm_w = c.GetSystemMetrics(0); // SM_CXSCREEN
+    const sm_h = c.GetSystemMetrics(1); // SM_CYSCREEN
+    const input_w: u32 = if (sm_w > 0) @intCast(sm_w) else display_width;
+    const input_h: u32 = if (sm_h > 0) @intCast(sm_h) else display_height;
+
+    std.debug.print("Mouse: gdigrab={d}x{d}, SendInput target={d}x{d}\n", .{ display_width, display_height, input_w, input_h });
+
     return .{
-        .scale_x = 65535.0 / @as(f64, @floatFromInt(display_width)),
-        .scale_y = 65535.0 / @as(f64, @floatFromInt(display_height)),
+        .scale_x = 65535.0 / @as(f64, @floatFromInt(input_w)),
+        .scale_y = 65535.0 / @as(f64, @floatFromInt(input_h)),
         .display_width = display_width,
         .display_height = display_height,
+        .input_width = input_w,
+        .input_height = input_h,
     };
 }
 
@@ -29,18 +44,20 @@ pub fn coordinates(mouse: *Mouse) !Coordinates {
         return error.GetCursorPosFailed;
     }
 
-    // the c.GetCursorPos has its own virtual coordinates, distinct from the
+    // GetCursorPos returns logical coordinates in the virtual screen space.
+    // Rescale to input_width/input_height space (SM_CXSCREEN) for consistency
+    // with SendInput absolute mode targeting the primary monitor.
     const virtual_width = c.GetSystemMetrics(c.SM_CXVIRTUALSCREEN);
     const virtual_height = c.GetSystemMetrics(c.SM_CYVIRTUALSCREEN);
 
     return Coordinates{
-        .x = @intFromFloat((@as(f64, @floatFromInt(point.x)) / @as(f64, @floatFromInt(virtual_width))) * @as(f64, @floatFromInt(mouse.display_width))),
-        .y = @intFromFloat((@as(f64, @floatFromInt(point.y)) / @as(f64, @floatFromInt(virtual_height))) * @as(f64, @floatFromInt(mouse.display_height))),
+        .x = @intFromFloat((@as(f64, @floatFromInt(point.x)) / @as(f64, @floatFromInt(virtual_width))) * @as(f64, @floatFromInt(mouse.input_width))),
+        .y = @intFromFloat((@as(f64, @floatFromInt(point.y)) / @as(f64, @floatFromInt(virtual_height))) * @as(f64, @floatFromInt(mouse.input_height))),
     };
 }
 
 pub fn move(mouse: *Mouse, target: Coordinates) !void {
-    if (target.x < 0 or target.x >= mouse.display_width or target.y < 0 or target.y >= mouse.display_height) {
+    if (target.x < 0 or target.x >= mouse.input_width or target.y < 0 or target.y >= mouse.input_height) {
         return error.OutOfBounds;
     }
 
@@ -119,7 +136,7 @@ pub fn move(mouse: *Mouse, target: Coordinates) !void {
 /// Move mouse instantly to target (no smooth interpolation).
 /// Saves ~100ms per move compared to smooth movement.
 pub fn moveInstant(mouse: *Mouse, target: Coordinates) !void {
-    if (target.x < 0 or target.x >= mouse.display_width or target.y < 0 or target.y >= mouse.display_height) {
+    if (target.x < 0 or target.x >= mouse.input_width or target.y < 0 or target.y >= mouse.input_height) {
         return error.OutOfBounds;
     }
 
