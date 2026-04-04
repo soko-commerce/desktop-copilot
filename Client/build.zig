@@ -35,52 +35,65 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addOptions("build_config", build_options);
 
-    // Add FFmpeg include and lib paths
+    // Add FFmpeg include and lib paths (from vendor directory)
     exe.addSystemIncludePath(b.path("vendor/ffmpeg/include"));
-    exe.addSystemIncludePath(b.path("vendor/ffmpeg/include/ffmpeg")); // Add FFmpeg include paths for FFMPEG.zig
+    exe.addSystemIncludePath(b.path("vendor/ffmpeg/include/ffmpeg"));
     exe.addLibraryPath(b.path("vendor/ffmpeg/lib"));
 
-    // Add MinGW include paths - these will bring in all the Windows headers
-    // Really only helpful for the Zig language server on macOS
-    exe.addSystemIncludePath(std.Build.LazyPath{ .cwd_relative = "/opt/homebrew/Cellar/mingw-w64/12.0.0_2/toolchain-x86_64/x86_64-w64-mingw32/include" });
+    // Additional vendor lib path for x264, winpthread, etc.
+    exe.addLibraryPath(b.path("vendor/lib"));
+
+    const host_os = @import("builtin").os.tag;
+    const target_info = target.result;
+
+    if (host_os == .windows) {
+        // Native Windows build — use MSYS2 MinGW64 paths if available
+        exe.addSystemIncludePath(.{ .cwd_relative = "C:/msys64/mingw64/include" });
+        exe.addLibraryPath(.{ .cwd_relative = "C:/msys64/mingw64/lib" });
+    } else {
+        // Cross-compile from macOS/Linux
+        exe.addSystemIncludePath(std.Build.LazyPath{ .cwd_relative = "/opt/homebrew/Cellar/mingw-w64/12.0.0_2/toolchain-x86_64/x86_64-w64-mingw32/include" });
+    }
+
     exe.linkLibC();
 
-    const target_info = target.result;
     if (target_info.os.tag == .windows) {
-        // Add MinGW library paths
-        exe.addLibraryPath(.{ .cwd_relative = "/usr/local/x86_64-w64-mingw32/lib" });
-        exe.addLibraryPath(.{ .cwd_relative = "/usr/local/x86_64-w64-mingw32/lib64" });
-        exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/Cellar/mingw-w64/12.0.0_2/toolchain-x86_64/x86_64-w64-mingw32/lib" });
+        if (host_os != .windows) {
+            // Cross-compile library paths (macOS/Linux → Windows)
+            exe.addLibraryPath(.{ .cwd_relative = "/usr/local/x86_64-w64-mingw32/lib" });
+            exe.addLibraryPath(.{ .cwd_relative = "/usr/local/x86_64-w64-mingw32/lib64" });
+            exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/Cellar/mingw-w64/12.0.0_2/toolchain-x86_64/x86_64-w64-mingw32/lib" });
+        }
 
-        // Windows system libraries - add these before FFmpeg
-        exe.linkSystemLibrary("kernel32"); // For windows time functions
-        exe.linkSystemLibrary("bcrypt"); // For crypto functions
-        exe.linkSystemLibrary("shell32"); // For shell functions
-        exe.linkSystemLibrary("shlwapi"); // For additional shell functions
-        exe.linkSystemLibrary("ole32"); // For COM/Media Foundation
-        exe.linkSystemLibrary("oleaut32"); // For OLE Automation
-        exe.linkSystemLibrary("winmm"); // For additional time functions
-        exe.linkSystemLibrary("ntdll"); // For additional system functions
-        exe.linkSystemLibrary("gdi32"); // For screen capture
-        exe.linkSystemLibrary("vfw32"); // For Video for Windows
-        exe.linkSystemLibrary("ws2_32"); // For Windows Sockets
-        exe.linkSystemLibrary("secur32"); // For Windows Security
-        exe.linkSystemLibrary("crypt32"); // For cryptography functions
+        // Windows system libraries
+        exe.linkSystemLibrary("kernel32");
+        exe.linkSystemLibrary("bcrypt");
+        exe.linkSystemLibrary("shell32");
+        exe.linkSystemLibrary("shlwapi");
+        exe.linkSystemLibrary("ole32");
+        exe.linkSystemLibrary("oleaut32");
+        exe.linkSystemLibrary("winmm");
+        exe.linkSystemLibrary("ntdll");
+        exe.linkSystemLibrary("gdi32");
+        exe.linkSystemLibrary("vfw32");
+        exe.linkSystemLibrary("ws2_32");
+        exe.linkSystemLibrary("secur32");
+        exe.linkSystemLibrary("crypt32");
         exe.linkSystemLibrary("ssl");
         exe.linkSystemLibrary("crypto");
 
-        // Add static winpthreads for POSIX time functions
-        exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/Cellar/mingw-w64/12.0.0_2/toolchain-x86_64/x86_64-w64-mingw32/lib/libwinpthread.a" });
+        // winpthread — try vendor/lib first, fall back to system paths
+        exe.linkSystemLibrary("winpthread");
 
         // Define Windows threading model to match FFmpeg build
         exe.defineCMacro("WIN32_LEAN_AND_MEAN", null);
         exe.defineCMacro("HAVE_WIN32_THREADS", "1");
         exe.defineCMacro("PTWS32_STATIC_LIB", "1");
-        exe.defineCMacro("_WIN32_WINNT", "0x0601"); // Windows 7 and above
+        exe.defineCMacro("_WIN32_WINNT", "0x0601");
 
-        // Third-party libraries (from MinGW)
-        exe.linkSystemLibrary("z"); // zlib for compression
-        exe.addObjectFile(.{ .cwd_relative = "/usr/local/x86_64-w64-mingw32/lib/libx264.a" }); // you'll likely need to build x264 yourself, see contributing/building_ffmpeg.md
+        // Third-party libraries
+        exe.linkSystemLibrary("z");
+        exe.linkSystemLibrary("x264");
         exe.linkSystemLibrary("d3d11");
     }
 
@@ -100,8 +113,6 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
