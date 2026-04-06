@@ -1,5 +1,6 @@
 """FastAPI routes for the VIDA agent service."""
 
+import asyncio
 import base64
 import logging
 import time
@@ -13,6 +14,10 @@ from api.models import (
     SearchPartsResponse,
     PartResult,
     HealthResponse,
+    LifecycleResponse,
+    BrowseCatalogRequest,
+    BrowseCatalogResponse,
+    CatalogCategory,
 )
 from agent.vida_agent import (
     build_vida_agent,
@@ -25,6 +30,7 @@ from agent.vida_prompts import VIDA_SEARCH_PROMPT
 from agent.result_parser import parse_agent_response
 from agent.direct_search import execute_part_search as direct_part_search
 from agent.vida_screens import VidaScreen
+from agent.vida_lifecycle import is_vida_running, ensure_ready
 from bridge.ws_bridge import WebSocketBridge
 from bridge.direct_client import DirectPigletClient
 
@@ -35,14 +41,30 @@ router = APIRouter(prefix="/api/vida")
 # Will be set by main.py on startup — either WebSocketBridge or DirectPigletClient
 bridge: WebSocketBridge | DirectPigletClient = None  # type: ignore
 
+# ---------- VIDA Search Queue ----------
+# VIDA is a single desktop application — only one search can run at a time.
+# All search endpoints acquire this lock, creating a FIFO queue.
+# Requests wait in order; no search can corrupt another.
+_vida_search_lock = asyncio.Lock()
+_queue_depth = 0  # track how many requests are waiting
+
 
 @router.get("/health", response_model=HealthResponse)
 async def health():
     detector = get_screen_detector()
+    vida_running = False
+    if bridge and bridge.connected:
+        try:
+            vida_running = await is_vida_running(bridge)
+        except Exception as e:
+            logger.warning(f"VIDA process check failed during health: {e}")
     return HealthResponse(
         status="ok" if bridge and bridge.connected else "no_piglet",
         piglet_connected=bridge.connected if bridge else False,
         piglet_fingerprint=bridge._piglet_fingerprint or "",
+        vida_process_running=vida_running,
+        search_queue_depth=_queue_depth,
+        search_busy=_vida_search_lock.locked(),
     )
 
 
@@ -53,10 +75,27 @@ async def search_parts(req: SearchPartsRequest):
       1. Scripted workflow (0 Claude calls on happy path)
       2. Claude OCR on results screenshot (1 Claude call for extraction)
       3. Full AI agent fallback (10-30 Claude calls if script fails)
+
+    Requests are serialized via FIFO queue — VIDA is a single desktop app.
     """
     if not bridge or not bridge.connected:
         raise HTTPException(503, "No piglet connected — cannot control VIDA")
 
+    global _queue_depth
+    _queue_depth += 1
+    position = _queue_depth
+    if position > 1:
+        logger.info(f"Search queued (position {position}): {req.query}")
+
+    async with _vida_search_lock:
+        _queue_depth -= 1
+        if position > 1:
+            logger.info(f"Search dequeued, starting: {req.query}")
+        return await _execute_search_parts(req)
+
+
+async def _execute_search_parts(req: SearchPartsRequest) -> SearchPartsResponse:
+    """Inner search logic — called under the VIDA search lock."""
     start = time.time()
     detector = get_screen_detector()
 
@@ -150,10 +189,25 @@ async def search_direct(req: SearchPartsRequest):
     Direct VIDA search — 2-3 Claude vision calls, no agent loop.
     Uses Claude to detect screen state and element positions, then
     executes a deterministic click/type sequence.
+
+    Requests are serialized via FIFO queue — VIDA is a single desktop app.
     """
     if not bridge or not bridge.connected:
         raise HTTPException(503, "No piglet connected — cannot control VIDA")
 
+    global _queue_depth
+    _queue_depth += 1
+    position = _queue_depth
+    if position > 1:
+        logger.info(f"Direct search queued (position {position}): {req.query}")
+
+    async with _vida_search_lock:
+        _queue_depth -= 1
+        return await _execute_search_direct(req)
+
+
+async def _execute_search_direct(req: SearchPartsRequest) -> SearchPartsResponse:
+    """Inner direct search logic — called under the VIDA search lock."""
     start = time.time()
     logger.info(f"Direct search: query='{req.query}', vin='{req.vin}', model='{req.model}', year='{req.year}'")
 
@@ -172,6 +226,118 @@ async def search_direct(req: SearchPartsRequest):
         steps_taken=result.get("steps_taken", 0),
         error=result.get("error", ""),
     )
+
+
+# --- Catalog browsing endpoints ---
+
+
+@router.post("/browse-catalog", response_model=BrowseCatalogResponse)
+async def browse_catalog(req: BrowseCatalogRequest):
+    """
+    Browse VIDA parts catalog visually when text search fails.
+
+    Two modes:
+      1. No category → returns ranked list of catalog categories
+      2. Category specified → drills in and returns parts/subcategories
+
+    Serialized via FIFO queue — VIDA is a single desktop app.
+    """
+    if not bridge or not bridge.connected:
+        raise HTTPException(503, "No piglet connected — cannot browse VIDA catalog")
+
+    global _queue_depth
+    _queue_depth += 1
+    position = _queue_depth
+    if position > 1:
+        logger.info(f"Browse queued (position {position}): {req.query}")
+
+    async with _vida_search_lock:
+        _queue_depth -= 1
+        return await _execute_browse_catalog(req)
+
+
+async def _execute_browse_catalog(req: BrowseCatalogRequest) -> BrowseCatalogResponse:
+    """Inner browse logic — called under the VIDA search lock."""
+    from agent.catalog_browse import get_catalog_categories, browse_category
+
+    start = time.time()
+
+    if not req.category:
+        # Phase 1: return ranked categories
+        logger.info(f"Browsing catalog categories for: {req.query}")
+        result = await get_catalog_categories(bridge, req.query)
+    else:
+        # Phase 2: drill into category, return parts
+        logger.info(f"Drilling into category '{req.category}' for: {req.query}")
+        result = await browse_category(bridge, req.category, req.query)
+
+    elapsed = time.time() - start
+    logger.info(f"Catalog browse completed in {elapsed:.1f}s — {result.get('claude_calls', 0)} Claude calls")
+
+    categories = [CatalogCategory(**c) for c in result.get("categories", [])]
+    parts = [PartResult(**p) for p in result.get("parts", [])]
+
+    return BrowseCatalogResponse(
+        success=result.get("success", False),
+        categories=categories,
+        parts=parts,
+        claude_calls=result.get("claude_calls", 0),
+        error=result.get("error", ""),
+    )
+
+
+# --- Lifecycle endpoints ---
+
+
+@router.get("/lifecycle", response_model=LifecycleResponse)
+async def lifecycle_check():
+    """Ensure VIDA is running, in foreground, and on the search page.
+
+    Orchestrates: process check → launch if needed → foreground → navigate to search.
+    Serialized with search operations — cannot run while a search is in progress.
+    """
+    if not bridge or not bridge.connected:
+        raise HTTPException(503, "No piglet connected — cannot check VIDA lifecycle")
+
+    async with _vida_search_lock:
+        status = await ensure_ready(bridge)
+    return LifecycleResponse(
+        ready=status.ready,
+        screen=status.screen,
+        launched=status.launched,
+        recovered=status.recovered,
+        error=status.error,
+    )
+
+
+@router.post("/lifecycle/recover", response_model=LifecycleResponse)
+async def lifecycle_recover():
+    """Force recovery to the VIDA search/home screen.
+
+    Use this when VIDA is stuck on an unexpected screen.
+    """
+    if not bridge or not bridge.connected:
+        raise HTTPException(503, "No piglet connected — cannot recover VIDA")
+
+    from agent.vida_lifecycle import go_to_home, bring_to_foreground
+
+    try:
+        await bring_to_foreground(bridge)
+        detection, claude_calls = await go_to_home(bridge)
+        screen = detection.get("screen", "unknown")
+        ready = screen in ("search_vehicle", "fine_tune")
+        return LifecycleResponse(
+            ready=ready,
+            screen=screen,
+            recovered=True,
+            error="" if ready else f"Recovery incomplete — stuck on '{screen}'",
+        )
+    except Exception as e:
+        logger.error(f"Lifecycle recovery failed: {e}", exc_info=True)
+        return LifecycleResponse(
+            ready=False,
+            error=str(e),
+        )
 
 
 # --- Calibration endpoints ---

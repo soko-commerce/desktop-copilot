@@ -31,3 +31,34 @@ class HealthResponse(BaseModel):
     status: str
     piglet_connected: bool
     piglet_fingerprint: str = ""
+    vida_process_running: bool = False
+    search_queue_depth: int = 0
+    search_busy: bool = False
+
+
+class LifecycleResponse(BaseModel):
+    ready: bool
+    screen: str = "unknown"
+    launched: bool = False
+    recovered: bool = False
+    error: str = ""
+
+
+class BrowseCatalogRequest(BaseModel):
+    query: str
+    category: str = ""
+    subcategory: str = ""
+
+
+class CatalogCategory(BaseModel):
+    name: str
+    relevance: str = ""
+    reason: str = ""
+
+
+class BrowseCatalogResponse(BaseModel):
+    success: bool
+    categories: list[CatalogCategory] = []
+    parts: list[PartResult] = []
+    claude_calls: int = 0
+    error: str = ""
