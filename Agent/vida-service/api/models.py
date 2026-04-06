@@ -62,3 +62,27 @@ class BrowseCatalogResponse(BaseModel):
     parts: list[PartResult] = []
     claude_calls: int = 0
     error: str = ""
+
+
+class ClassifyPartRequest(BaseModel):
+    query: str
+    use_llm: bool = False
+
+
+class PredictedPath(BaseModel):
+    category: str
+    subcategory: str = ""
+    confidence: float = 0.0
+    reasoning: str = ""
+
+
+class ClassifyPartResponse(BaseModel):
+    predicted_paths: list[PredictedPath] = []
+    is_exact_part_number: bool = False
+    part_family: str = "unknown"
+
+
+class FullTreeSearchRequest(BaseModel):
+    query: str
+    exclude_categories: list[str] = []
+    max_categories: int = 4

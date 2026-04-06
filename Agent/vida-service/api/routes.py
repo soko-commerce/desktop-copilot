@@ -18,6 +18,10 @@ from api.models import (
     BrowseCatalogRequest,
     BrowseCatalogResponse,
     CatalogCategory,
+    ClassifyPartRequest,
+    ClassifyPartResponse,
+    PredictedPath,
+    FullTreeSearchRequest,
 )
 from agent.vida_agent import (
     build_vida_agent,
@@ -283,6 +287,107 @@ async def _execute_browse_catalog(req: BrowseCatalogRequest) -> BrowseCatalogRes
         parts=parts,
         claude_calls=result.get("claude_calls", 0),
         error=result.get("error", ""),
+    )
+
+
+# --- Part classifier endpoint ---
+
+
+@router.post("/classify-part", response_model=ClassifyPartResponse)
+async def classify_part(req: ClassifyPartRequest):
+    """Classify a part query into VIDA categories using heuristic keyword matching.
+
+    Fast (<1ms), no Claude calls. Returns predicted category paths with confidence scores.
+    """
+    from agent.part_classifier import classify_part as do_classify
+
+    result = do_classify(req.query)
+    return ClassifyPartResponse(
+        predicted_paths=[PredictedPath(**p) for p in result["predicted_paths"]],
+        is_exact_part_number=result["is_exact_part_number"],
+        part_family=result["part_family"],
+    )
+
+
+# --- Full tree search endpoint ---
+
+
+@router.post("/full-tree-search", response_model=BrowseCatalogResponse)
+async def full_tree_search(req: FullTreeSearchRequest):
+    """Autonomously search multiple catalog categories for a part.
+
+    Iterates through high-relevance categories, drilling into each until parts are found.
+    Serialized via FIFO queue — VIDA is a single desktop app.
+    """
+    if not bridge or not bridge.connected:
+        raise HTTPException(503, "No piglet connected — cannot browse VIDA catalog")
+
+    global _queue_depth
+    _queue_depth += 1
+    position = _queue_depth
+    if position > 1:
+        logger.info(f"Full tree search queued (position {position}): {req.query}")
+
+    async with _vida_search_lock:
+        _queue_depth -= 1
+        return await _execute_full_tree_search(req)
+
+
+async def _execute_full_tree_search(req: FullTreeSearchRequest) -> BrowseCatalogResponse:
+    """Inner full tree search logic — called under the VIDA search lock."""
+    from agent.catalog_browse import get_catalog_categories, browse_category
+
+    start = time.time()
+    total_claude_calls = 0
+    all_parts = []
+    exclude_set = set(req.exclude_categories)
+
+    logger.info(f"Full tree search: query='{req.query}', excluding {len(exclude_set)} categories")
+
+    # Step 1: Get all categories
+    cat_result = await get_catalog_categories(bridge, req.query)
+    total_claude_calls += cat_result.get("claude_calls", 0)
+
+    if not cat_result.get("success") or not cat_result.get("categories"):
+        elapsed = time.time() - start
+        logger.warning(f"Full tree search: no categories found in {elapsed:.1f}s")
+        return BrowseCatalogResponse(
+            success=False,
+            claude_calls=total_claude_calls,
+            error=cat_result.get("error", "No categories found"),
+        )
+
+    # Step 2: Rank and filter categories
+    categories = cat_result["categories"]
+    ranked = sorted(categories, key=lambda c: {"high": 0, "medium": 1, "low": 2}.get(c.get("relevance", "low"), 2))
+    candidates = [c for c in ranked if c["name"] not in exclude_set][:req.max_categories]
+
+    logger.info(f"Full tree search: trying {len(candidates)} categories: {[c['name'] for c in candidates]}")
+
+    # Step 3: Drill into each category until we find parts
+    for cat in candidates:
+        logger.info(f"Full tree search: exploring '{cat['name']}'")
+        drill_result = await browse_category(bridge, cat["name"], req.query)
+        total_claude_calls += drill_result.get("claude_calls", 0)
+
+        parts = drill_result.get("parts", [])
+        if parts:
+            all_parts.extend(parts)
+            logger.info(f"Full tree search: found {len(parts)} parts in '{cat['name']}'")
+            break  # Found parts, stop searching
+
+    elapsed = time.time() - start
+    logger.info(f"Full tree search completed in {elapsed:.1f}s — {len(all_parts)} parts, {total_claude_calls} Claude calls")
+
+    cat_models = [CatalogCategory(**c) for c in categories]
+    part_models = [PartResult(**p) if isinstance(p, dict) else p for p in all_parts]
+
+    return BrowseCatalogResponse(
+        success=len(all_parts) > 0,
+        categories=cat_models,
+        parts=part_models,
+        claude_calls=total_claude_calls,
+        error="" if all_parts else "No parts found in any category",
     )
 
 

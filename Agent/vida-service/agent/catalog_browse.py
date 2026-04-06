@@ -104,9 +104,15 @@ CATEGORY_LOCATE_PROMPT = """You are analyzing a 1024x768 screenshot of the VIDA 
 The main content area shows a parts catalog category tree.
 
 Find the category "{category_name}" (or closest match) and provide click coordinates.
-If the category is already expanded, list its visible subcategories.
+If the category is already expanded (has a ▲ arrow or visible child items indented below it),
+list ALL its visible subcategories.
 
-For each subcategory, assess relevance to the user's query: "{query}"
+The user is looking for: "{query}"
+Think carefully about which subcategory is MOST LIKELY to contain this specific part.
+For example:
+- "brake pads" → subcategory about wheel brakes / disc brakes, NOT brake lines or master cylinder
+- "front beam" / "subframe" → subcategory about suspension frame / chassis
+- "headlight" → subcategory about front lighting
 
 Return ONLY this JSON (no other text):
 {{
@@ -114,7 +120,7 @@ Return ONLY this JSON (no other text):
   "target": {{"x": 123, "y": 456}},
   "expanded": false,
   "subcategories": [
-    {{"name": "subcategory text", "x": 130, "y": 180, "relevance": "high|medium|low", "reason": "brief explanation"}}
+    {{"name": "subcategory text", "x": 130, "y": 180, "relevance": "high|medium|low", "reason": "why this subcategory does or does not contain {query}"}}
   ]
 }}
 
