@@ -135,15 +135,28 @@ If the category is NOT visible, return:
 
 
 def _parse_json_response(text: str) -> dict:
-    """Parse JSON from Claude response, handling markdown code blocks."""
+    """Parse JSON from Claude response, handling markdown code blocks and preamble text."""
     try:
+        # Try 1: code block
         if "```" in text:
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
+            block = text.split("```")[1]
+            if block.startswith("json"):
+                block = block[4:]
+            return json.loads(block.strip())
+
+        # Try 2: direct JSON
         return json.loads(text.strip())
     except json.JSONDecodeError:
-        logger.error(f"Failed to parse JSON response: {text[:300]}")
+        pass
+
+    # Try 3: find the first { and last } — extract embedded JSON
+    try:
+        first_brace = text.index("{")
+        last_brace = text.rindex("}")
+        candidate = text[first_brace:last_brace + 1]
+        return json.loads(candidate)
+    except (ValueError, json.JSONDecodeError):
+        logger.error(f"Failed to parse JSON response: {text[:500]}")
         return {}
 
 
